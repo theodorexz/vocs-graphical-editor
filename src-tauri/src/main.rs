@@ -2,6 +2,7 @@
 
 use serde::Serialize;
 use std::{
+    collections::VecDeque,
     fs,
     io::{BufRead, BufReader},
     path::{Component, Path, PathBuf},
@@ -10,7 +11,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
@@ -69,10 +70,14 @@ fn list_pages_for(project: &ProjectState) -> Result<Vec<PageInfo>, String> {
         for entry in entries {
             let entry = entry.map_err(|e| e.to_string())?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || name == "node_modules" { continue; }
+            if name.starts_with('.') || name.eq_ignore_ascii_case("node_modules") { continue; }
+            let file_type = entry.file_type().map_err(|e| e.to_string())?;
+            // Don't follow symlinked directories: repositories often link shared
+            // workspaces or dependency trees back into the docs tree.
+            if file_type.is_symlink() { continue; }
             let path = entry.path();
-            if path.is_dir() { walk(base, &path, found)?; }
-            else if path.extension().and_then(|v| v.to_str()).is_some_and(|v| v.eq_ignore_ascii_case("md") || v.eq_ignore_ascii_case("mdx")) {
+            if file_type.is_dir() { walk(base, &path, found)?; }
+            else if file_type.is_file() && path.extension().and_then(|v| v.to_str()).is_some_and(|v| v.eq_ignore_ascii_case("md") || v.eq_ignore_ascii_case("mdx")) {
                 let relative = path.strip_prefix(base).map_err(|e| e.to_string())?.to_string_lossy().replace('\\', "/");
                 let title = Path::new(&relative).file_stem().unwrap_or_default().to_string_lossy().replace(['-', '_'], " ");
                 found.push(PageInfo { path: relative, title });
@@ -95,14 +100,29 @@ fn validate_page_path(project: &ProjectState, file: &str) -> Result<PathBuf, Str
     Ok(project.root.join(&project.pages_dir).join(relative))
 }
 
+fn contains_markdown(dir: &Path, depth: usize) -> bool {
+    // A bounded probe is enough for a plain Markdown folder. Never recursively
+    // walk an entire Vocs repository just to decide which pages folder to use.
+    if depth > 3 { return false; }
+    let Ok(entries) = fs::read_dir(dir) else { return false; };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || name.eq_ignore_ascii_case("node_modules") || matches!(name.as_str(), "target" | "dist" | "build" | "coverage" | "vendor" | "out") { continue; }
+        let Ok(file_type) = entry.file_type() else { continue; };
+        if file_type.is_symlink() { continue; }
+        let path = entry.path();
+        if file_type.is_dir() && contains_markdown(&path, depth + 1) { return true; }
+        if file_type.is_file() && path.extension().and_then(|v| v.to_str()).is_some_and(|v| v.eq_ignore_ascii_case("md") || v.eq_ignore_ascii_case("mdx")) { return true; }
+    }
+    false
+}
+
 fn load_project(root: PathBuf, app: &AppHandle) -> Result<ProjectState, String> {
     let package_path = root.join("package.json");
-    let package_text = fs::read_to_string(&package_path).map_err(|_| "Choose the Vocs project root—the folder containing package.json.".to_string())?;
-    let package: serde_json::Value = serde_json::from_str(&package_text).map_err(|_| "Could not read the project's package.json.".to_string())?;
+    let package_text = fs::read_to_string(&package_path).ok();
+    let package: serde_json::Value = package_text.as_deref().and_then(|text| serde_json::from_str(text).ok()).unwrap_or_default();
     let has_vocs = ["dependencies", "devDependencies", "peerDependencies"].iter().any(|section| package.get(section).and_then(|v| v.get("vocs")).is_some());
     let config_path = CONFIGS.iter().map(|name| root.join(name)).find(|path| path.is_file());
-    if config_path.is_none() && !has_vocs { return Err("This folder does not look like a Vocs project. Choose its root folder (look for vocs.config.ts and package.json).".into()); }
-
     let config_source = config_path.as_ref().and_then(|p| fs::read_to_string(p).ok());
     let source_dir = config_source.as_deref().and_then(|source| {
         let marker = "srcDir";
@@ -118,8 +138,26 @@ fn load_project(root: PathBuf, app: &AppHandle) -> Result<ProjectState, String> 
     }).unwrap_or_else(|| "src".into());
 
     let candidates = [format!("{source_dir}/pages"), "src/pages".into(), "pages".into(), "docs/pages".into()];
-    let pages_dir = candidates.iter().find(|candidate| root.join(candidate).is_dir()).cloned().unwrap_or_else(|| format!("{source_dir}/pages"));
-    fs::create_dir_all(root.join(&pages_dir)).map_err(|e| format!("Could not create the pages folder: {e}"))?;
+    let existing_pages = candidates.iter().find(|candidate| root.join(candidate).is_dir()).cloned();
+    let markdown_pages = candidates.iter().find(|candidate| root.join(candidate).is_dir() && contains_markdown(&root.join(candidate), 0)).cloned();
+    // If the folder is already recognizable as a Vocs project, the configured
+    // pages directory is authoritative. In particular, don't search the repo
+    // root just because its pages directory is empty: it may contain huge tools,
+    // generated assets, and dependency trees.
+    let has_root_markdown = if config_path.is_none() && !has_vocs {
+        contains_markdown(&root, 0)
+    } else {
+        false
+    };
+    if config_path.is_none() && !has_vocs && existing_pages.is_none() && !has_root_markdown {
+        return Err("Choose a folder with Markdown pages, or a Vocs project folder.".into());
+    }
+    let configured_pages = format!("{source_dir}/pages");
+    let pages_dir = markdown_pages
+        .or_else(|| if has_root_markdown && config_path.is_none() && !has_vocs { Some(".".into()) } else { None })
+        .or(existing_pages)
+        .unwrap_or(configured_pages);
+    if pages_dir != "." { fs::create_dir_all(root.join(&pages_dir)).map_err(|e| format!("Could not create the pages folder: {e}"))?; }
     let project = ProjectState { root, pages_dir, sidebar_source: config_source };
     let user_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     fs::create_dir_all(&user_dir).map_err(|e| e.to_string())?;
@@ -128,10 +166,23 @@ fn load_project(root: PathBuf, app: &AppHandle) -> Result<ProjectState, String> 
 }
 
 #[tauri::command]
-fn choose_project(app: AppHandle, state: State<'_, EditorState>) -> Result<Option<ProjectInfo>, String> {
-    let Some(selection) = app.dialog().file().set_title("Choose your Vocs project folder").blocking_pick_folder() else { return Ok(None); };
+async fn choose_project(app: AppHandle, state: State<'_, EditorState>) -> Result<Option<ProjectInfo>, String> {
+    // Native file dialogs must not block Tauri's main thread: macOS can leave the
+    // entire window unresponsive while Finder's folder picker is open. Run the
+    // plugin's blocking bridge on a dedicated worker; it dispatches the actual
+    // native dialog to the main thread and keeps the WebView event loop free.
+    let dialog_app = app.clone();
+    let selection = tauri::async_runtime::spawn_blocking(move || {
+        dialog_app.dialog().file().set_title("Choose a docs folder or Vocs project").blocking_pick_folder()
+    })
+    .await
+    .map_err(|e| format!("Could not open the folder picker: {e}"))?;
+    let Some(selection) = selection else { return Ok(None); };
     let root = selection.into_path().map_err(|_| "Could not read the selected folder path.".to_string())?;
-    let project = load_project(root, &app)?;
+    let load_app = app.clone();
+    let project = tauri::async_runtime::spawn_blocking(move || load_project(root, &load_app))
+        .await
+        .map_err(|e| format!("Could not read the selected docs folder: {e}"))??;
     if let Ok(mut server) = state.server.lock() { if let Some(mut child) = server.take() { let _ = child.kill(); } }
     if let Ok(mut preview) = state.preview_base.lock() { *preview = None; }
     let info = project_info(&project)?;
@@ -193,35 +244,153 @@ fn extract_local_url(line: &str) -> Option<String> {
     None
 }
 
+fn emit_preview_status(app: &AppHandle, status: &str) {
+    let _ = app.emit("vocs-preview-status", status.to_string());
+}
+
+fn package_manager(root: &Path, package: &serde_json::Value) -> (&'static str, Vec<&'static str>) {
+    let declared = package.get("packageManager").and_then(|value| value.as_str()).unwrap_or("");
+    if declared.starts_with("pnpm") {
+        return ("pnpm", if root.join("pnpm-lock.yaml").is_file() { vec!["install", "--prod=false", "--frozen-lockfile"] } else { vec!["install", "--prod=false"] });
+    }
+    if declared.starts_with("yarn") {
+        let has_lock = root.join("yarn.lock").is_file();
+        let immutable = root.join(".yarnrc.yml").is_file();
+        return ("yarn", if !has_lock { vec!["install"] } else if immutable { vec!["install", "--immutable"] } else { vec!["install", "--frozen-lockfile"] });
+    }
+    if declared.starts_with("bun") {
+        let has_lock = root.join("bun.lock").is_file() || root.join("bun.lockb").is_file();
+        return ("bun", if has_lock { vec!["install", "--frozen-lockfile"] } else { vec!["install"] });
+    }
+    if declared.starts_with("npm") { return if root.join("package-lock.json").is_file() || root.join("npm-shrinkwrap.json").is_file() { ("npm", vec!["ci"]) } else { ("npm", vec!["install"]) }; }
+    if root.join("pnpm-lock.yaml").is_file() {
+        return ("pnpm", if root.join("pnpm-lock.yaml").is_file() { vec!["install", "--prod=false", "--frozen-lockfile"] } else { vec!["install", "--prod=false"] });
+    }
+    if root.join("yarn.lock").is_file() {
+        let has_lock = root.join("yarn.lock").is_file();
+        let immutable = root.join(".yarnrc.yml").is_file();
+        return ("yarn", if !has_lock { vec!["install"] } else if immutable { vec!["install", "--immutable"] } else { vec!["install", "--frozen-lockfile"] });
+    }
+    if root.join("bun.lock").is_file() || root.join("bun.lockb").is_file() {
+        let has_lock = root.join("bun.lock").is_file() || root.join("bun.lockb").is_file();
+        return ("bun", if has_lock { vec!["install", "--frozen-lockfile"] } else { vec!["install"] });
+    }
+    if root.join("package-lock.json").is_file() || root.join("npm-shrinkwrap.json").is_file() {
+        ("npm", vec!["ci"])
+    } else {
+        ("npm", vec!["install"])
+    }
+}
+
+fn manager_command(program: &str, args: &[&str], root: &Path) -> Command {
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.arg("/C").arg(program).args(args);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = Command::new(program);
+        command.args(args);
+        command
+    };
+    command.current_dir(root);
+    #[cfg(target_os = "macos")]
+    {
+        let path = std::env::var("PATH").unwrap_or_default();
+        command.env("PATH", format!("{path}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"));
+    }
+    command
+}
+
+fn dependency_install_error(program: &str, output: std::process::Output) -> String {
+    let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout).lines().chain(String::from_utf8_lossy(&output.stderr).lines()).map(str::to_owned).collect();
+    let detail = if lines.len() > 8 { lines.drain(..lines.len() - 8); lines.join("\n") } else { lines.join("\n") };
+    let hint = if output.status.code() == Some(127) {
+        format!("{program} could not find a required command. Check that Node.js and the selected package manager are installed.")
+    } else {
+        format!("{program} exited with {}.", output.status)
+    };
+    if detail.is_empty() { format!("Could not install the project's dependencies. {hint}") }
+    else { format!("Could not install the project's dependencies. {hint}\n{}", detail) }
+}
+
+fn install_dependencies(app: &AppHandle, root: &Path, package: &serde_json::Value) -> Result<(), String> {
+    let (manager, args) = package_manager(root, package);
+    emit_preview_status(app, &format!("Installing dependencies with {manager}… This may take a few minutes."));
+    let mut command = manager_command(manager, &args, root);
+    command.env("NODE_ENV", "development");
+    let output = command.output().map_err(|error| {
+        format!("Could not run {manager} to install dependencies: {error}. Install Node.js and {manager}, then retry.")
+    })?;
+    if !output.status.success() { return Err(dependency_install_error(manager, output)); }
+    Ok(())
+}
+
 #[tauri::command]
-fn preview(state: State<'_, EditorState>, file: String) -> Result<String, String> {
+async fn preview(app: AppHandle, file: String) -> Result<String, String> {
+    // Starting Vocs can take a while (especially on the first run). Keep npm,
+    // filesystem reads, and the readiness poll off Tauri's UI/event thread.
+    tauri::async_runtime::spawn_blocking(move || preview_blocking(app, file))
+        .await
+        .map_err(|e| format!("Could not start Vocs preview: {e}"))?
+}
+
+fn preview_blocking(app: AppHandle, file: String) -> Result<String, String> {
+    let state = app.state::<EditorState>();
     let project = state_project(&state)?;
     let _ = validate_page_path(&project, &file)?;
-    let base = if let Some(base) = state.preview_base.lock().map_err(|e| e.to_string())?.clone() { base } else {
+    let cached_base = state.preview_base.lock().map_err(|e| e.to_string())?.clone();
+    let server_is_running = if cached_base.is_some() {
+        let mut server = state.server.lock().map_err(|e| e.to_string())?;
+        let running = server.as_mut().map(|child| child.try_wait().map(|status| status.is_none())).transpose().map_err(|e| e.to_string())?.unwrap_or(false);
+        if !running { if let Some(mut child) = server.take() { let _ = child.kill(); } }
+        running
+    } else { false };
+    if !server_is_running { *state.preview_base.lock().map_err(|e| e.to_string())? = None; }
+    let base = if server_is_running {
+        let base = cached_base.unwrap_or_default();
+        emit_preview_status(&app, "Vocs is already running · opening this page…");
+        base
+    } else {
         if let Ok(mut old) = state.server.lock() { if let Some(mut child) = old.take() { let _ = child.kill(); } }
         let package_text = fs::read_to_string(project.root.join("package.json")).map_err(|_| "Could not read the project package.json.".to_string())?;
         let package: serde_json::Value = serde_json::from_str(&package_text).map_err(|_| "Could not read the project package.json.".to_string())?;
-        if package.get("scripts").and_then(|s| s.get("dev")).is_none() { return Err("This Vocs project has no \"dev\" script. Add one (usually \"vocs dev\") or start the docs server yourself.".into()); }
-        #[cfg(windows)]
-        let mut command = { let mut c = Command::new("cmd"); c.args(["/C", "npm", "run", "dev", "--", "--host", "127.0.0.1"]); c };
-        #[cfg(not(windows))]
-        let mut command = { let mut c = Command::new("npm"); c.args(["run", "dev", "--", "--host", "127.0.0.1"]); c };
-        command.current_dir(&project.root).stdout(Stdio::piped()).stderr(Stdio::piped());
-        #[cfg(target_os = "macos")]
-        { let path = std::env::var("PATH").unwrap_or_default(); command.env("PATH", format!("{path}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")); }
-        let mut child = command.spawn().map_err(|e| format!("Could not start Vocs: {e}. Make sure Node.js and npm are installed."))?;
+        let dev_script = package.get("scripts").and_then(|scripts| scripts.get("dev")).and_then(|value| value.as_str()).ok_or_else(|| "This Vocs project has no \"dev\" script. Add one (usually \"vocs dev\") or start the docs server yourself.".to_string())?;
+        let (manager, _) = package_manager(&project.root, &package);
+        let vocs_cli = project.root.join("node_modules/.bin/vocs");
+        let vocs_cli_windows = project.root.join("node_modules/.bin/vocs.cmd");
+        let needs_install = !project.root.join("node_modules").is_dir() || (dev_script.contains("vocs") && !vocs_cli.exists() && !vocs_cli_windows.exists());
+        if needs_install { install_dependencies(&app, &project.root, &package)?; }
+        emit_preview_status(&app, "Starting the Vocs development server…");
+        let args = ["run", "dev", "--", "--host", "127.0.0.1"];
+        let mut command = manager_command(manager, &args, &project.root);
+        command.env("NODE_ENV", "development").stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = command.spawn().map_err(|e| format!("Could not start Vocs with {manager}: {e}. Install Node.js and {manager}, then retry."))?;
         let (tx, rx) = mpsc::channel::<String>();
         if let Some(stdout) = child.stdout.take() { let tx = tx.clone(); thread::spawn(move || for line in BufReader::new(stdout).lines().flatten() { let _ = tx.send(line); }); }
         if let Some(stderr) = child.stderr.take() { let tx = tx.clone(); thread::spawn(move || for line in BufReader::new(stderr).lines().flatten() { let _ = tx.send(line); }); }
         let began = Instant::now();
         let mut detected = None;
+        let mut recent_output = VecDeque::new();
+        emit_preview_status(&app, "Waiting for Vocs to become ready…");
         while began.elapsed() < Duration::from_secs(45) {
-            while let Ok(line) = rx.try_recv() { if let Some(url) = extract_local_url(&line) { detected = Some(url); break; } }
+            while let Ok(line) = rx.try_recv() {
+                if recent_output.len() == 8 { recent_output.pop_front(); }
+                recent_output.push_back(line.clone());
+                if let Some(url) = extract_local_url(&line) { detected = Some(url); break; }
+            }
             if detected.is_some() { break; }
-            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? { return Err(format!("The Vocs dev server exited before starting (code {status}). Check the project's dev script and dependencies.")); }
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                while let Ok(line) = rx.try_recv() { if recent_output.len() == 8 { recent_output.pop_front(); } recent_output.push_back(line); }
+                let output = recent_output.into_iter().collect::<Vec<_>>().join("\n");
+                let advice = if status.code() == Some(127) { "The dev script could not find its Vocs command. The app tried to restore missing dependencies; check the dev script and package manager output below." } else { "Check the dev script and package manager output below." };
+                return Err(if output.is_empty() { format!("The Vocs dev server exited before starting (code {status}). {advice}") } else { format!("The Vocs dev server exited before starting (code {status}). {advice}\n{output}") });
+            }
             thread::sleep(Duration::from_millis(150));
         }
-        let base = detected.ok_or_else(|| { let _ = child.kill(); "Vocs did not start within 45 seconds. Check the project's dev script and port.".to_string() })?;
+        let base = match detected { Some(base) => base, None => { let _ = child.kill(); return Err(format!("Vocs did not start within 45 seconds. Check the project's dev script and port.{}", if recent_output.is_empty() { String::new() } else { format!("\n{}", recent_output.into_iter().collect::<Vec<_>>().join("\n")) })); } };
         *state.server.lock().map_err(|e| e.to_string())? = Some(child);
         *state.preview_base.lock().map_err(|e| e.to_string())? = Some(base.clone());
         base

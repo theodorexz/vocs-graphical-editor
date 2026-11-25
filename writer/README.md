@@ -7,9 +7,9 @@ A local desktop/web editor for existing Vocs documentation projects. The desktop
 1. Start the desktop app and choose the repository root (the folder with `package.json` and `vocs.config.*`, or a `vocs` dependency).
 2. The editor scans the project's configured `srcDir/pages` folder (Vocs defaults to `src/pages`) and lists existing `.md` and `.mdx` pages.
 3. Open a page, edit its Markdown/MDX source, and save. Existing YAML frontmatter and unrecognized MDX are preserved. New pages are saved under the Vocs pages directory.
-4. Preview saves pending edits, starts the repository's `npm run dev` script, detects the local URL and opens the current page route. The project must have its dependencies installed and a working `dev` script.
+4. Preview saves pending edits, restores missing dependencies from the project's lockfile when needed, starts its `dev` script with the detected package manager, and opens the current page route. Keep Node.js installed and use a working `dev` script.
 
-The local browser build can connect to a folder using the browser's folder permission picker. Its preview expects the docs site to already be running; set the preview address in the preview pane. The desktop build starts the Vocs dev script itself.
+The local browser build can connect to a folder using the browser's folder permission picker. Its preview expects the docs site to already be running; set the preview address in the preview pane. The desktop build can install missing project dependencies and start the Vocs dev script itself.
 
 ## Build
 

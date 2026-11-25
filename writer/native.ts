@@ -1,4 +1,5 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { parseSidebar } from './sidebar.mjs';
 
 type NativeProject = { root: string; pagesDir: string; name: string; pages: Array<{path:string;title:string}>; sidebarSource?: string | null };
@@ -15,6 +16,7 @@ if (isTauri()) {
     readPage: (file) => invoke('read_page', { file }),
     savePage: (file, content) => invoke('save_page', { file, content }),
     preview: (file) => invoke('preview', { file }),
+    onPreviewStatus: (listener) => listen<string>('vocs-preview-status', event => listener(event.payload)),
     openFolder: () => invoke('open_folder'),
     openPreview: (url) => invoke('open_preview', { url }),
   };
