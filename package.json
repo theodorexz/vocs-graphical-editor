@@ -1,0 +1,40 @@
+{
+  "name": "vocs-graphical-editor",
+  "version": "0.1.0",
+  "description": "A local visual editor for Vocs documentation projects.",
+  "private": true,
+  "scripts": {
+    "writer": "vite --config writer/vite.config.ts",
+    "writer:typecheck": "tsc --project writer/tsconfig.json",
+    "writer:build": "npm run writer:typecheck && vite build --config writer/vite.config.ts",
+    "writer:tauri": "tauri dev",
+    "writer:tauri:build": "tauri build",
+    "writer:mac:arm64": "tauri build --target aarch64-apple-darwin",
+    "writer:mac:x64": "tauri build --target x86_64-apple-darwin",
+    "writer:win": "tauri build --bundles nsis",
+    "writer:linux": "tauri build --bundles appimage"
+  },
+  "dependencies": {
+    "@babel/parser": "^8.1.3",
+    "@tauri-apps/api": "^2.12.5",
+    "@tauri-apps/plugin-dialog": "^2.8.4",
+    "@tauri-apps/plugin-opener": "^2.7.3",
+    "@vitejs/plugin-react": "^4.3.3",
+    "lucide-react": "^1.79.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "rehype-raw": "^7.0.0",
+    "rehype-sanitize": "^6.0.0",
+    "remark-directive": "^4.0.0",
+    "remark-gfm": "^4.0.1",
+    "tauri": "^0.15.0",
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.6",
+    "@types/react": "^18.3.32",
+    "@types/react-dom": "^18.3.7"
+  }
+}

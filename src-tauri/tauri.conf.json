@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Vocs Graphical Editor",
+  "version": "0.1.0",
+  "identifier": "com.vocs.graphicaleditor",
+  "build": {
+    "beforeDevCommand": "npm run writer -- --host 127.0.0.1 --port 5175",
+    "devUrl": "http://localhost:5175",
+    "beforeBuildCommand": "npm run writer:build",
+    "frontendDist": "../writer-dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Vocs Graphical Editor",
+        "width": 1440,
+        "height": 960,
+        "minWidth": 1000,
+        "minHeight": 680,
+        "backgroundColor": "#f8f9fb"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "nsis", "appimage"],
+    "category": "DeveloperTool"
+  }
+}
