@@ -1,11 +1,20 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { parseSidebar } from './sidebar.mjs';
+import { parseVocsConfig } from './sidebar.mjs';
 
-type NativeProject = { root: string; pagesDir: string; name: string; pages: Array<{path:string;title:string}>; sidebarSource?: string | null };
+type NativeProject = {
+  root: string;
+  pagesDir: string;
+  name: string;
+  pages: Array<{ path: string; title: string }>;
+  sidebarSource?: string | null;
+};
+
 async function projectResult(promise: Promise<NativeProject | null>) {
   const project = await promise;
-  return project ? { ...project, sidebar: project.sidebarSource ? parseSidebar(project.sidebarSource) : [] } : null;
+  if (!project) return null;
+  const vocsConfig = project.sidebarSource ? parseVocsConfig(project.sidebarSource) : parseVocsConfig('');
+  return { ...project, sidebar: vocsConfig.sidebar, vocsConfig };
 }
 
 if (isTauri()) {

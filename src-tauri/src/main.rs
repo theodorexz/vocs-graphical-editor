@@ -63,7 +63,9 @@ fn project_info(project: &ProjectState) -> Result<ProjectInfo, String> {
 }
 
 fn list_pages_for(project: &ProjectState) -> Result<Vec<PageInfo>, String> {
-    let base = project.root.join(&project.pages_dir);
+    let root = fs::canonicalize(&project.root).map_err(|e| format!("Could not resolve the project folder: {e}"))?;
+    let base = fs::canonicalize(project.root.join(&project.pages_dir)).map_err(|e| format!("Could not resolve the docs directory: {e}"))?;
+    if !base.starts_with(&root) { return Err("The configured docs directory resolves outside the project folder.".into()); }
     let mut found = Vec::new();
     fn walk(base: &Path, dir: &Path, found: &mut Vec<PageInfo>) -> Result<(), String> {
         let entries = match fs::read_dir(dir) { Ok(entries) => entries, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()), Err(e) => return Err(e.to_string()) };
@@ -96,8 +98,163 @@ fn validate_page_path(project: &ProjectState, file: &str) -> Result<PathBuf, Str
         return Err("That page path is not allowed.".into());
     }
     let ext = relative.extension().and_then(|v| v.to_str()).unwrap_or("");
-    if !ext.eq_ignore_ascii_case("md") && !ext.eq_ignore_ascii_case("mdx") { return Err("Only .md and .mdx pages can be opened here.".into()); }
-    Ok(project.root.join(&project.pages_dir).join(relative))
+    if !ext.eq_ignore_ascii_case("md") && !ext.eq_ignore_ascii_case("mdx") {
+        return Err("Only .md and .mdx pages can be opened here.".into());
+    }
+
+    // Lexical checks alone do not protect against a symlink placed inside the
+    // docs directory. Resolve the nearest existing ancestor and confirm that
+    // it remains beneath the canonical pages root before any read or write.
+    let root = fs::canonicalize(&project.root)
+        .map_err(|e| format!("Could not resolve the project folder: {e}"))?;
+    let base = fs::canonicalize(project.root.join(&project.pages_dir))
+        .map_err(|e| format!("Could not resolve the docs directory: {e}"))?;
+    if !base.starts_with(&root) {
+        return Err("The configured docs directory resolves outside the project folder.".into());
+    }
+    let target = base.join(relative);
+    let mut existing = target.as_path();
+    while !existing.exists() {
+        existing = existing.parent().ok_or_else(|| "That page path is not allowed.".to_string())?;
+    }
+    let resolved = fs::canonicalize(existing)
+        .map_err(|e| format!("Could not resolve the page path: {e}"))?;
+    if !resolved.starts_with(&base) {
+        return Err("That page path resolves outside the docs directory.".into());
+    }
+    if target.exists() {
+        let resolved_target = fs::canonicalize(&target)
+            .map_err(|e| format!("Could not resolve the page path: {e}"))?;
+        if !resolved_target.starts_with(&base) {
+            return Err("That page path resolves outside the docs directory.".into());
+        }
+    }
+    Ok(target)
+}
+
+fn js_config_tokens(source: &str) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() { i += 1; continue; }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' { i += 1; }
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') { i += 1; }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if b == b'\'' || b == b'"' {
+            let quote = b;
+            let content_start = i + 1;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() { i += 2; }
+                else if bytes[i] == quote { break; }
+                else { i += 1; }
+            }
+            let content_end = i;
+            if i < bytes.len() { i += 1; }
+            let value = String::from_utf8_lossy(&bytes[content_start..content_end])
+                .replace("\\'", "'").replace("\\\"", "\"").replace("\\\\", "\\");
+            tokens.push(format!("s:{value}"));
+            continue;
+        }
+        if b == b'`' {
+            // Templates may contain expressions; treat the whole template as
+            // opaque so text inside it cannot masquerade as a config property.
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' { i = (i + 2).min(bytes.len()); }
+                else if bytes[i] == b'`' { i += 1; break; }
+                else { i += 1; }
+            }
+            tokens.push("<template>".into());
+            continue;
+        }
+        if b.is_ascii_alphabetic() || b == b'_' || b == b'$' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$') { i += 1; }
+            tokens.push(source[start..i].to_string());
+            continue;
+        }
+        tokens.push((b as char).to_string());
+        i += 1;
+    }
+    tokens
+}
+
+fn find_config_object(tokens: &[String]) -> Option<usize> {
+    // Only inspect the default-exported Vocs config. This avoids mistaking a
+    // helper object or an unrelated defineConfig call for project settings.
+    for i in 0..tokens.len().saturating_sub(2) {
+        if tokens[i] != "export" || tokens[i + 1] != "default" { continue; }
+        match tokens[i + 2].as_str() {
+            "{" => return Some(i + 2),
+            "defineConfig" if tokens.get(i + 3).map(String::as_str) == Some("(")
+                && tokens.get(i + 4).map(String::as_str) == Some("{") => return Some(i + 4),
+            name => {
+                // A common pattern is `const config = { ... }; export default config`.
+                // Also accept a statically declared `const config = defineConfig({ ... })`.
+                for j in 0..i.saturating_sub(3) {
+                    if !matches!(tokens[j].as_str(), "const" | "let" | "var")
+                        || tokens[j + 1] != name || tokens[j + 2] != "=" { continue; }
+                    if tokens[j + 3] == "{" { return Some(j + 3); }
+                    if tokens[j + 3] == "defineConfig"
+                        && tokens.get(j + 4).map(String::as_str) == Some("(")
+                        && tokens.get(j + 5).map(String::as_str) == Some("{") {
+                        return Some(j + 5);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_static_config_string(source: &str, key: &str) -> Option<String> {
+    let tokens = js_config_tokens(source);
+    let object = find_config_object(&tokens)?;
+    let mut depth = 1_i32;
+    let mut i = object + 1;
+    while i + 2 < tokens.len() {
+        match tokens[i].as_str() {
+            "{" => depth += 1,
+            "}" => {
+                depth -= 1;
+                if depth == 0 { break; }
+            }
+            _ => {}
+        }
+        if depth == 1 && (tokens[i] == key || tokens[i] == format!("s:{key}")) && tokens[i + 1] == ":" {
+            if let Some(value) = tokens[i + 2].strip_prefix("s:") {
+                return Some(value.to_string());
+            }
+            // Resolve a simple top-level string binding, e.g. `const docs = 'docs';`
+            // followed by `srcDir: docs`. Dynamic expressions stay unresolved.
+            let binding = &tokens[i + 2];
+            if binding.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+                && binding.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+                for j in 0..object.saturating_sub(3) {
+                    if matches!(tokens[j].as_str(), "const" | "let" | "var")
+                        && tokens[j + 1].as_str() == binding.as_str() && tokens[j + 2] == "=" {
+                        if let Some(value) = tokens[j + 3].strip_prefix("s:") {
+                            return Some(value.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn contains_markdown(dir: &Path, depth: usize) -> bool {
@@ -124,18 +281,22 @@ fn load_project(root: PathBuf, app: &AppHandle) -> Result<ProjectState, String> 
     let has_vocs = ["dependencies", "devDependencies", "peerDependencies"].iter().any(|section| package.get(section).and_then(|v| v.get("vocs")).is_some());
     let config_path = CONFIGS.iter().map(|name| root.join(name)).find(|path| path.is_file());
     let config_source = config_path.as_ref().and_then(|p| fs::read_to_string(p).ok());
-    let source_dir = config_source.as_deref().and_then(|source| {
-        let marker = "srcDir";
-        let at = source.find(marker)?;
-        let tail = &source[at + marker.len()..];
-        let colon = tail.find(':')?;
-        let value = tail[colon + 1..].trim_start();
-        let quote = value.chars().next()?;
-        if quote != '\'' && quote != '"' { return None; }
-        let rest = &value[1..];
-        let end = rest.find(quote)?;
-        Some(rest[..end].trim_start_matches("./").trim_end_matches('/').to_string())
-    }).unwrap_or_else(|| "src".into());
+    let source_dir = config_source.as_deref()
+        .and_then(|source| find_static_config_string(source, "srcDir"))
+        .and_then(|value| {
+            let path = Path::new(&value);
+            if path.is_absolute() { return None; }
+            let mut parts = Vec::new();
+            for component in path.components() {
+                match component {
+                    Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+                    Component::CurDir => {},
+                    _ => return None,
+                }
+            }
+            Some(if parts.is_empty() { ".".into() } else { parts.join("/") })
+        })
+        .unwrap_or_else(|| "src".into());
 
     let candidates = [format!("{source_dir}/pages"), "src/pages".into(), "pages".into(), "docs/pages".into()];
     let existing_pages = candidates.iter().find(|candidate| root.join(candidate).is_dir()).cloned();
@@ -210,6 +371,9 @@ fn save_page(state: State<'_, EditorState>, file: String, content: String) -> Re
     let project = state_project(&state)?;
     let target = validate_page_path(&project, &file)?;
     if let Some(parent) = target.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    // Re-check after directory creation to close the ordinary symlink path
+    // escape case before writing to disk.
+    let target = validate_page_path(&project, &file)?;
     fs::write(&target, content).map_err(|e| format!("Could not save {file}: {e}"))?;
     Ok(serde_json::json!({"path":file,"absolutePath":target,"pages":list_pages_for(&project)?}))
 }
@@ -430,4 +594,63 @@ fn main() {
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event { if let Ok(mut slot) = app.state::<EditorState>().server.lock() { if let Some(mut child) = slot.take() { let _ = child.kill(); } } }
         });
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temporary_project() -> (PathBuf, ProjectState) {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("vocs-editor-test-{}-{stamp}", std::process::id()));
+        fs::create_dir_all(root.join("src/pages")).unwrap();
+        let project = ProjectState { root: root.clone(), pages_dir: "src/pages".into(), sidebar_source: None };
+        (root, project)
+    }
+
+    #[test]
+    fn config_src_dir_ignores_comments_and_nested_properties() {
+        let source = r#"
+            // srcDir: '../wrong'
+            export default defineConfig({
+              nested: { srcDir: 'nested-wrong' },
+              srcDir: './content',
+            })
+        "#;
+        assert_eq!(find_static_config_string(source, "srcDir").as_deref(), Some("./content"));
+    }
+
+    #[test]
+    fn config_src_dir_supports_a_static_named_export() {
+        let source = "const config = { srcDir: 'docs' }; export default config;";
+        assert_eq!(find_static_config_string(source, "srcDir").as_deref(), Some("docs"));
+    }
+
+    #[test]
+    fn config_src_dir_resolves_a_static_string_binding() {
+        let source = "const docsDir = './content'; const config = { srcDir: docsDir }; export default config;";
+        assert_eq!(find_static_config_string(source, "srcDir").as_deref(), Some("./content"));
+    }
+
+    #[test]
+    fn page_path_rejects_parent_traversal() {
+        let (root, project) = temporary_project();
+        assert!(validate_page_path(&project, "../outside.mdx").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn page_path_rejects_symlinks_that_escape_docs() {
+        use std::os::unix::fs::symlink;
+        let (root, project) = temporary_project();
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.mdx"), "outside").unwrap();
+        symlink(&outside, root.join("src/pages/linked")).unwrap();
+        assert!(validate_page_path(&project, "linked/secret.mdx").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
 }

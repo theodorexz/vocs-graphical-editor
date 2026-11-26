@@ -4,7 +4,7 @@ import remarkGfm from 'remark-gfm';
 import remarkDirective from 'remark-directive';
 import rehypeRaw from 'rehype-raw';
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
-import { parseSidebar } from './sidebar.mjs';
+import { parseVocsConfig } from './sidebar.mjs';
 import './native';
 import { createRoot } from 'react-dom/client';
 import {
@@ -29,7 +29,8 @@ class MarkdownErrorBoundary extends React.Component<React.PropsWithChildren, { f
 
 type PageInfo = { path: string; title: string };
 type SidebarNode = { text:string; link:string; collapsed:boolean; external:boolean; items:SidebarNode[]; filePath?:string };
-type ProjectInfo = { root: string; pagesDir: string; name: string; pages: PageInfo[]; sidebar?: SidebarNode[] };
+type VocsConfig = { title:string; description:string; srcDir:string; logoUrl:string; iconUrl:string; banner?:any; accentColor:string; colorScheme:string; sidebar:SidebarNode[]; topNav:SidebarNode[] };
+type ProjectInfo = { root: string; pagesDir: string; name: string; pages: PageInfo[]; sidebar?: SidebarNode[]; vocsConfig?: VocsConfig };
 type DesktopBridge = {
   chooseProject: () => Promise<ProjectInfo | null>;
   currentProject: () => Promise<ProjectInfo | null>;
@@ -185,13 +186,16 @@ async function browserList(handle:any, prefix=''):Promise<PageInfo[]> {
   }
   return result.sort((a,b)=>a.path.localeCompare(b.path));
 }
+function cleanVocsConfig():VocsConfig { return {title:'',description:'',srcDir:'src',logoUrl:'',iconUrl:'',banner:undefined,accentColor:'light-dark(black, white)',colorScheme:'light dark',sidebar:[],topNav:[]}; }
+
 async function chooseBrowserProject():Promise<ProjectInfo|null> {
   if(!window.showDirectoryPicker) throw new Error('This browser cannot connect to folders. Open this editor in the desktop app or use a current Chromium-based browser.');
   const root=await window.showDirectoryPicker({mode:'readwrite'});
   const pkgFile=await root.getFileHandle('package.json').catch(()=>null);
   let pkg:any={};if(pkgFile){try{pkg=JSON.parse(await (await pkgFile.getFile()).text());}catch{pkg={};}}
-  let configured=false, sourceDir='src', sidebar:SidebarNode[]=[];
-  for(const c of CONFIGS) { const config=await root.getFileHandle(c).catch(()=>null);if(config){configured=true;try{const text=await (await config.getFile()).text();const match=text.match(/\bsrcDir\s*:\s*['"]([^'"]+)['"]/);if(match)sourceDir=match[1].replace(/^\.\//,'').replace(/\/$/,'');sidebar=parseSidebar(text) as SidebarNode[];}catch{}} }
+  let configured=false, vocsConfig=cleanVocsConfig();
+  for(const c of CONFIGS) { const config=await root.getFileHandle(c).catch(()=>null);if(config){configured=true;try{vocsConfig=parseVocsConfig(await (await config.getFile()).text()) as VocsConfig;}catch{vocsConfig=cleanVocsConfig();}} }
+  const sourceDir=vocsConfig.srcDir||'src', sidebar=vocsConfig.sidebar||[];
   const hasVocs=Boolean(pkg.dependencies?.vocs||pkg.devDependencies?.vocs||pkg.peerDependencies?.vocs);
   let pagesHandle:any=null, pagesDir='';
   const candidates=[...new Set([`${sourceDir}/pages`,...PAGE_DIRS])];
@@ -212,9 +216,9 @@ async function chooseBrowserProject():Promise<ProjectInfo|null> {
     else if(emptyCandidate){pagesDir=emptyCandidate;pagesHandle=root;for(const p of pagesDir.split('/'))pagesHandle=await pagesHandle.getDirectoryHandle(p);}
     else throw new Error('Choose a folder with Markdown pages, or a Vocs project folder.');
   }
-  browserProject={root:root.name,pagesDir,name:root.name,pages:[],sidebar,handle:root,pagesHandle};
+  browserProject={root:root.name,pagesDir,name:root.name,pages:[],sidebar,vocsConfig,handle:root,pagesHandle};
   browserProject.pages=await browserList(pagesHandle);
-  return {root:root.name,pagesDir,name:root.name,pages:browserProject.pages,sidebar};
+  return {root:root.name,pagesDir,name:root.name,pages:browserProject.pages,sidebar,vocsConfig};
 }
 
 function fileHierarchy(pages:PageInfo[]):SidebarNode[]{
@@ -222,12 +226,17 @@ function fileHierarchy(pages:PageInfo[]):SidebarNode[]{
   for(const page of pages){const parts=page.path.split('/');let cursor=root.items;for(const dir of parts.slice(0,-1)){let group=cursor.find(item=>item.text===dir&&!item.filePath);if(!group){group={text:dir,link:'',collapsed:false,external:false,items:[]};cursor.push(group);}cursor=group.items;}const routePage={text:page.title,link:'',collapsed:false,external:false,items:[],filePath:page.path};cursor.push(routePage);}
   return root.items;
 }
-function pageForLink(link:string,pages:PageInfo[]){
-  if(!link||/^(https?:|mailto:)/i.test(link))return undefined;
-  let route=link.split('#')[0].split('?')[0].replace(/^\/+|\/+$/g,'');try{route=decodeURIComponent(route);}catch{}
+function pageForLink(link:string,pages:PageInfo[],currentFile='') {
+  if(!link||/^(https?:|mailto:|tel:|\/\/)/i.test(link))return undefined;
+  let route=link.split('#')[0].split('?')[0];
+  if(!route)return undefined;
+  try{route=decodeURIComponent(route);}catch{}
+  if(!route.startsWith('/')){const directory=currentFile.includes('/')?currentFile.slice(0,currentFile.lastIndexOf('/')+1):'';route=`${directory}${route}`;}
+  const segments:string[]=[];for(const part of route.replace(/^\/+/, '').split('/')){if(!part||part==='.')continue;if(part==='..'){segments.pop();continue;}segments.push(part);}
+  route=segments.join('/').replace(/\.(md|mdx)$/i,'').replace(/\/index$/,'');
   const exact=pages.find(page=>page.path.replace(/\.(md|mdx)$/i,'').replace(/\/index$/,'')===route);
   if(exact)return exact;
-  if(!route){return pages.find(page=>/^index\.(md|mdx)$/i.test(page.path));}
+  if(!route)return pages.find(page=>/^index\.(md|mdx)$/i.test(page.path));
   return pages.find(page=>page.path.replace(/\.(md|mdx)$/i,'')===`${route}/index`);
 }
 function FileTreeItem({item,depth=0}:{item:any;depth?:number}){
@@ -237,13 +246,69 @@ function VocsCodeGroup({children}:React.PropsWithChildren){
   const items=React.Children.toArray(children).filter(React.isValidElement) as React.ReactElement[];const [active,setActive]=useState(0);if(!items.length)return null;const current=items[Math.min(active,items.length-1)];return <div className="visual-code-group"><div className="visual-code-tabs">{items.map((item,index)=><button key={index} className={active===index?'active':''} onClick={()=>setActive(index)}>{(item.props as any)['data-title']||(item.props as any).dataTitle||`Example ${index+1}`}</button>)}</div><div className="visual-code-content">{current}</div></div>;
 }
 function nodeAttr(props:any,name:string){return props[name]??props[name.replace(/-([a-z])/g,(_,c:string)=>c.toUpperCase())];}
+function textFromReact(value:any):string {
+  if(value===null||value===undefined||typeof value==='boolean')return '';
+  if(typeof value==='string'||typeof value==='number')return String(value);
+  if(Array.isArray(value))return value.map(textFromReact).join('');
+  if(React.isValidElement(value))return textFromReact((value.props as any).children);
+  return '';
+}
+function slugifyHeading(value:string){
+  return value.toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g,'').replace(/[`*_~[\](){}<>]/g,'').replace(/[^\p{L}\p{N}\s-]/gu,'').trim().replace(/\s+/g,'-').replace(/-+/g,'-')||'section';
+}
+function extractHeadings(markdown:string){
+  const result:Array<{level:number;text:string;id:string;line:number}>=[];
+  let fence:string|null=null;
+  markdown.split(/\r?\n/).forEach((line,index)=>{
+    const marker=line.match(/^\s{0,3}(```+|~~~+)/);
+    if(marker){if(!fence)fence=marker[1][0];else if(fence===marker[1][0])fence=null;return;}
+    if(fence)return;
+    const match=line.match(/^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if(!match)return;
+    const text=match[2].replace(/`([^`]+)`/g,'$1').replace(/\[([^\]]+)\]\([^)]+\)/g,'$1').replace(/[*_~]/g,'').trim();
+    result.push({level:match[1].length,text,id:`${slugifyHeading(text)}-${index+1}`,line:index+1});
+  });
+  return result;
+}
+function VocsTabs({children,node,visualProps}:{children:React.ReactNode;node:any;visualProps:(node:any,kind:string)=>any}){
+  const items=React.Children.toArray(children).filter(React.isValidElement) as React.ReactElement[];
+  const [active,setActive]=useState(0);
+  const buttonRefs=useRef<Array<HTMLButtonElement|null>>([]);
+  const id=React.useId();
+  if(!items.length)return null;
+  const selected=Math.min(active,items.length-1);
+  const select=(index:number,focus=false)=>{const next=(index+items.length)%items.length;setActive(next);if(focus)requestAnimationFrame(()=>buttonRefs.current[next]?.focus());};
+  return <div className="vocs-mdx-tabs" {...visualProps(node,'tabs')}>
+    <div className="vocs-mdx-tablist" role="tablist" aria-label="Content examples">
+      {items.map((item,index)=>{
+        const title=(item.props as any).title||`Tab ${index+1}`;
+        return <button ref={element=>{buttonRefs.current[index]=element;}} key={index} id={`${id}-tab-${index}`} type="button" role="tab" aria-selected={selected===index} aria-controls={`${id}-panel-${index}`} tabIndex={selected===index?0:-1} className={selected===index?'active':''} onClick={()=>select(index)} onKeyDown={event=>{if(event.key==='ArrowRight'){event.preventDefault();select(active+1,true);}else if(event.key==='ArrowLeft'){event.preventDefault();select(active-1,true);}else if(event.key==='Home'){event.preventDefault();select(0,true);}else if(event.key==='End'){event.preventDefault();select(items.length-1,true);}}}>{title}</button>;
+      })}
+    </div>
+    {items.map((item,index)=><div key={index} id={`${id}-panel-${index}`} role="tabpanel" aria-labelledby={`${id}-tab-${index}`} hidden={selected!==index} tabIndex={0} className="vocs-mdx-tab-panel">{item}</div>)}
+  </div>;
+}
+function VocsCodeBlock({children,node,visualProps}:{children:any;node:any;visualProps:(node:any,kind:string)=>any}){
+  const [copied,setCopied]=useState(false);
+  const codeElement=React.Children.toArray(children).find(React.isValidElement) as React.ReactElement|undefined;
+  const codeProps=(codeElement?.props||{}) as any;
+  const language=String(codeProps.className||'').match(/language-([\w.+-]+)/)?.[1]||'text';
+  const code=textFromReact(codeProps.children??children).replace(/\n$/,'');
+  useEffect(()=>{if(!copied)return;const timer=window.setTimeout(()=>setCopied(false),1400);return()=>window.clearTimeout(timer);},[copied]);
+  const copy=async()=>{try{if(navigator.clipboard?.writeText)await navigator.clipboard.writeText(code);else{const field=document.createElement('textarea');field.value=code;field.setAttribute('readonly','');field.style.position='fixed';field.style.opacity='0';document.body.appendChild(field);field.select();const copied=document.execCommand('copy');field.remove();if(!copied)throw new Error('Clipboard unavailable');}setCopied(true);}catch{setCopied(false);}};
+  return <div className="vocs-code-frame" {...visualProps(node,'code')}>
+    <div className="vocs-code-toolbar"><span>{language}</span><button type="button" onClick={()=>void copy()} aria-label="Copy code">{copied?<Check size={13}/>:<Copy size={13}/>} {copied?'Copied':'Copy'}</button></div>
+    <pre className="mdx-code-block"><code className={codeProps.className||undefined}>{codeProps.children??children}</code></pre>
+  </div>;
+}
 
 function App(){
   const desktop=window.vocsEditorDesktop;
   const [project,setProject]=useState<ProjectInfo|null>(null),[pages,setPages]=useState<PageInfo[]>([]),[currentFile,setCurrentFile]=useState(''),[title,setTitle]=useState('Untitled page'),[body,setBody]=useState(''),[frontmatter,setFrontmatter]=useState(''),[activeTab,setActiveTab]=useState<'insert'|'page'|'block'>('insert');
   const [search,setSearch]=useState(''),[status,setStatus]=useState('Connect a docs folder to begin'),[busy,setBusy]=useState(false),[dirty,setDirty]=useState(false),[previewBase,setPreviewBase]=useState(()=>{try{return localStorage.getItem('vocs-editor-preview-url')||'http://localhost:5173'}catch{return 'http://localhost:5173'}}),[previewUrl,setPreviewUrl]=useState(''),[previewError,setPreviewError]=useState(''),[showPreview,setShowPreview]=useState(false),[previewMode,setPreviewMode]=useState<'local'|'vocs'>('local'),[previewRefresh,setPreviewRefresh]=useState(0),[showNav,setShowNav]=useState(true);
   const [darkMode,setDarkMode]=useState(()=>{try{const saved=localStorage.getItem('vocs-editor-theme');return saved?saved==='dark':Boolean(window.matchMedia?.('(prefers-color-scheme: dark)').matches)}catch{return false}});
-  const [accentTheme,setAccentTheme]=useState<'slate'|'ocean'|'violet'|'ember'>(()=>{try{const saved=localStorage.getItem('vocs-editor-accent');return saved==='ocean'||saved==='violet'||saved==='ember'?saved:'slate'}catch{return 'slate'}});
+  const [accentTheme,setAccentTheme]=useState<'project'|'slate'|'ocean'|'violet'|'ember'>(()=>{try{const saved=localStorage.getItem('vocs-editor-accent');return saved==='project'||saved==='slate'||saved==='ocean'||saved==='violet'||saved==='ember'?saved:'project'}catch{return 'project'}});
+  const [previewViewport,setPreviewViewport]=useState<'desktop'|'tablet'|'mobile'>('desktop');
   const [themeMenuOpen,setThemeMenuOpen]=useState(false);
   const [commandOpen,setCommandOpen]=useState(false),[commandQuery,setCommandQuery]=useState(''),[commandIndex,setCommandIndex]=useState(0);
   const commandInput=useRef<HTMLInputElement>(null);
@@ -253,6 +318,7 @@ function App(){
   const textarea=useRef<HTMLTextAreaElement>(null),caret=useRef(0),dirtyRef=useRef(false),fileRef=useRef(''),dragSession=useRef<any>(null),suppressPaletteClick=useRef(false),bodyRef=useRef(body);
   const historyRef=useRef<{undo:Array<{body:string;title:string;range:typeof selectedRange}>;redo:Array<{body:string;title:string;range:typeof selectedRange}>;lastTyping:number}>({undo:[],redo:[],lastTyping:0});
   const localClipboard=useRef('');
+  const previewNavigationRef=useRef<(path:string)=>void>(()=>{});
   const selectedRangeRef=useRef(selectedRange);selectedRangeRef.current=selectedRange;
   const visualActionsRef=useRef<{selectNode:(node:any,kind:string)=>void;commitInline:(node:any,element:HTMLElement)=>void}>({selectNode:()=>{},commitInline:()=>{}});
   const setDocumentBody=(value:string)=>{bodyRef.current=value;setBody(value);};
@@ -275,6 +341,7 @@ function App(){
   const selectedModel=selectedRange?editableModel(body,selectedRange,selectedRange.kind):null;
   const navNodes=hierarchyMode==='vocs'&&project?.sidebar?.length?project.sidebar:fileHierarchy(pages);
   const markdownPlugins=useMemo(()=>mdxPlugins(),[]);
+  const previewHeadings=useMemo(()=>extractHeadings(body),[body]);
   useEffect(()=>{const update=()=>{const selection=window.getSelection(),anchor=selection?.anchorNode;const owner=anchor?.nodeType===Node.ELEMENT_NODE?anchor as Element:anchor?.parentElement;const inEditor=Boolean(viewMode==='visual'&&selection&&!selection.isCollapsed&&selection.toString()&&owner?.closest('.visual-sheet .visual-body [contenteditable="true"]'));setVisualTextSelection(value=>value===inEditor?value:inEditor);};document.addEventListener('selectionchange',update);return()=>document.removeEventListener('selectionchange',update);},[viewMode]);
   useEffect(()=>{if(!desktop?.onPreviewStatus)return;let unlisten:(()=>void)|undefined;let cancelled=false;desktop.onPreviewStatus(message=>setStatus(message)).then(stop=>{if(cancelled)stop();else unlisten=stop;}).catch(error=>console.warn('Could not listen for preview status:',error));return()=>{cancelled=true;unlisten?.();};},[desktop]);
   useEffect(()=>{try{localStorage.setItem('vocs-editor-split',String(splitRatio));localStorage.setItem('vocs-editor-zoom',String(previewZoom));localStorage.setItem('vocs-editor-accent',accentTheme);localStorage.setItem('vocs-editor-preview-url',previewBase);}catch{}},[splitRatio,previewZoom,accentTheme,previewBase]);
@@ -283,37 +350,39 @@ function App(){
   visualActionsRef.current={selectNode,commitInline};
   const visualProps=(node:any,kind:string)=>{const range=sourceRange(node);return range?{'data-source-start':range.start,'data-source-end':range.end,'data-source-kind':kind,'data-selected':selectedRangeRef.current?.start===range.start?'true':undefined,'onClick':(e:React.MouseEvent)=>{e.stopPropagation();visualActionsRef.current.selectNode(node,kind);}}:{onClick:undefined};};
   const buildMarkdownComponents=(editableText:boolean)=>{
-    const inline=(Tag:any,kind:string,cls='')=>({node,children,...props}:any)=>{const editable=editableText&&['paragraph','heading','list-item'].includes(kind);return <Tag {...props} className={`${props.className||''} mdx-node ${cls}`} {...visualProps(node,kind)} contentEditable={editable} suppressContentEditableWarning={editable} spellCheck={editable} onInput={editable?()=>{markDirty(true);setStatus('Unsaved visual edit');}:undefined} onBlur={editable?(e:React.FocusEvent<HTMLElement>)=>{if(e.currentTarget===e.target)visualActionsRef.current.commitInline(node,e.currentTarget);}:undefined}>{children}</Tag>;};
+    const inline=(Tag:any,kind:string,cls='')=>({node,children,...props}:any)=>{const editable=editableText&&['paragraph','heading','list-item'].includes(kind);const headingId=kind==='heading'?`${slugifyHeading(textFromReact(children))}-${node?.position?.start?.line||1}`:undefined;return <Tag {...props} id={props.id||headingId} className={`${props.className||''} mdx-node ${cls}`} {...renderProps(node,kind)} contentEditable={editable} suppressContentEditableWarning={editable} spellCheck={editable} onInput={editable?()=>{markDirty(true);setStatus('Unsaved visual edit');}:undefined} onBlur={editable?(e:React.FocusEvent<HTMLElement>)=>{if(e.currentTarget===e.target)visualActionsRef.current.commitInline(node,e.currentTarget);}:undefined}>{children}</Tag>;};
     const selectContainer=(node:any,kind:string)=>({onClickCapture:(e:React.MouseEvent)=>{if((e.target as HTMLElement).closest('[contenteditable="true"]'))return;e.stopPropagation();visualActionsRef.current.selectNode(node,kind);}});
+    const renderProps=(node:any,kind:string)=>editableText?visualProps(node,kind):{};
+    const renderSelectContainer=(node:any,kind:string)=>editableText?selectContainer(node,kind):{};
     return {
       h1:inline('h1','heading'),h2:inline('h2','heading'),h3:inline('h3','heading'),h4:inline('h4','heading'),h5:inline('h5','heading'),h6:inline('h6','heading'),
       p:inline('p','paragraph'),ul:inline('ul','list'),ol:inline('ol','list'),blockquote:inline('blockquote','blockquote'),li:inline('li','list-item'),
-      pre:({node,children,...props}:any)=>{const prompt=nodeAttr(props,'data-v-prompt');return prompt?<div className="vocs-prompt" {...visualProps(node,'prompt')}><span>Run this command</span><code>{prompt}</code></div>:<pre {...props} className="mdx-code-block" {...visualProps(node,'code')}>{children}</pre>},
-      img:({node,...props}:any)=><img {...props} className="mdx-node" {...visualProps(node,'image')}/>,
-      hr:({node,...props}:any)=><hr {...props} {...visualProps(node,'divider')}/>,
-      input:({node,...props}:any)=><input {...props} readOnly className="mdx-node" {...visualProps(node,'task')} onClick={e=>{e.preventDefault();visualActionsRef.current.selectNode(node,'task');}}/>,
-      video:({node,...props}:any)=><video {...props} className="mdx-node" {...visualProps(node,'video')} onClick={e=>{e.preventDefault();visualActionsRef.current.selectNode(node,'video');}}/>,
-      aside:({node,children,...props}:any)=>{const variant=nodeAttr(props,'data-vocs-variant')||nodeAttr(props,'data-v-context')||'info';const title=nodeAttr(props,'data-vocs-title')||nodeAttr(props,'data-v-title')||variant.charAt(0).toUpperCase()+variant.slice(1);return <aside className={`vocs-callout callout-${variant}`} {...visualProps(node,'callout')} {...selectContainer(node,'callout')}><div className="callout-heading"><span className="callout-icon">{variant==='warning'||variant==='danger'?<AlertCircle size={16}/>:variant==='success'?<CheckCircle2 size={16}/>:<Info size={16}/>}</span><b>{title}</b></div><div className="callout-content">{children}</div></aside>;},
-      callout:({node,children,...props}:any)=><aside className={`vocs-callout callout-${props.variant||'info'}`} {...visualProps(node,'callout')} {...selectContainer(node,'callout')}><div className="callout-heading"><span className="callout-icon">{props.variant==='warning'||props.variant==='danger'?<AlertCircle size={16}/>:props.variant==='success'?<CheckCircle2 size={16}/>:<Info size={16}/>}</span><b>{props.title||props.variant||'Info'}</b></div><div className="callout-content">{children}</div></aside>,
-      badge:({node,children,...props}:any)=><span data-v-badge="" data-v-context={props.variant||'info'} className={`vocs-badge badge-${props.variant||'info'} mdx-node`} {...visualProps(node,'badge')}>{children}</span>,
-      cards:({node,children,...props}:any)=><div className="vocs-cards" {...visualProps(node,'cards')}>{children}</div>,
-      card:({node,...props}:any)=><a href={props.to||'#'} className="vocs-card" {...visualProps(node,'card')} onClick={e=>{e.preventDefault();visualActionsRef.current.selectNode(node,'card');}}><b>{props.title||'Card title'}</b><span>{props.description||''}</span></a>,
-      tabs:({node,children,...props}:any)=><div className="vocs-mdx-tabs" {...visualProps(node,'tabs')}>{children}</div>,
-      tab:({node,children,...props}:any)=><section className="vocs-mdx-tab" {...visualProps(node,'tab')}><h3>{props.title||'Tab'}</h3>{children}</section>,
-      div:({node,children,...props}:any)=>{const fileItems=nodeAttr(props,'data-v-file-tree-items');if(nodeAttr(props,'data-v-file-tree')!==undefined&&fileItems){let parsed:any[]=[];try{parsed=JSON.parse(fileItems)}catch{}return <div className="vocs-file-tree" {...visualProps(node,'file-tree')}><ul>{parsed.map((item:any,index)=><FileTreeItem key={`${item.name}-${index}`} item={item}/>)}</ul></div>;}
-        if(nodeAttr(props,'data-v-code-group')!==undefined)return <div {...visualProps(node,'code-group')}><VocsCodeGroup>{children}</VocsCodeGroup></div>;
-        if(nodeAttr(props,'data-v-steps')!==undefined)return <div className="vocs-steps" {...visualProps(node,'steps')}>{children}</div>;
-        if(nodeAttr(props,'data-v-terminal')!==undefined)return <div className="vocs-terminal" {...visualProps(node,'terminal')}>{children}</div>;
-        if(nodeAttr(props,'data-v-changelog')!==undefined)return <div className="vocs-feature-card" {...visualProps(node,'changelog')}><Archive size={17}/><div><b>Vocs changelog</b><span>Rendered from the connected project's changelog configuration.</span></div></div>;
-        if(nodeAttr(props,'data-v-benchmarks')!==undefined)return <div className="vocs-benchmarks" {...visualProps(node,'benchmarks')}><Table2 size={16}/><div>{children}</div></div>;
-        return <div {...props} className={`${props.className||''} mdx-node`} {...visualProps(node,'container')}>{children}</div>;},
-      table:({node,children,...props}:any)=><div className="mdx-table-wrap" {...visualProps(node,'table')}><table {...props}>{children}</table></div>,
-      span:({node,children,...props}:any)=>{const variant=nodeAttr(props,'data-v-context')||'info';if(nodeAttr(props,'data-v-badge')!==undefined)return <span data-v-badge="" data-v-context={variant} className={`vocs-badge badge-${variant} mdx-node`} {...visualProps(node,'badge')}>{children}</span>;return <span {...props} {...visualProps(node,'span')}>{children}</span>;},
-      a:({node,children,...props}:any)=>{const todo=props.href==='/TODO'||nodeAttr(props,'data-v-dead-link')!==undefined;return <a {...props} className={todo?'vocs-todo-link':props.className} title={todo?'TODO — page not written yet':props.title} {...visualProps(node,todo?'todo':'link')} onClick={e=>{e.preventDefault();visualActionsRef.current.selectNode(node,todo?'todo':'link');}}>{children}</a>;},
+      pre:({node,children,...props}:any)=>{const prompt=nodeAttr(props,'data-v-prompt');return prompt?<div className="vocs-prompt" {...renderProps(node,'prompt')}><span>Run this command</span><code>{prompt}</code></div>:<VocsCodeBlock node={node} children={children} visualProps={renderProps}/>},
+      img:({node,...props}:any)=><img {...props} className="mdx-node" {...renderProps(node,'image')}/>,
+      hr:({node,...props}:any)=><hr {...props} {...renderProps(node,'divider')}/>,
+      input:({node,...props}:any)=><input {...props} readOnly className="mdx-node" {...renderProps(node,'task')} onClick={editableText?e=>{e.preventDefault();visualActionsRef.current.selectNode(node,'task');}:undefined}/>,
+      video:({node,...props}:any)=><video {...props} className="mdx-node" {...renderProps(node,'video')} onClick={editableText?e=>{e.preventDefault();visualActionsRef.current.selectNode(node,'video');}:undefined}/>,
+      aside:({node,children,...props}:any)=>{const variant=nodeAttr(props,'data-vocs-variant')||nodeAttr(props,'data-v-context')||'info';const title=nodeAttr(props,'data-vocs-title')||nodeAttr(props,'data-v-title')||'';const icon=variant==='warning'||variant==='danger'?<AlertCircle size={17}/>:variant==='success'?<CheckCircle2 size={17}/>:variant==='tip'?<Sparkles size={17}/>:<Info size={17}/>;return <aside className={`vocs-callout callout-${variant}`} {...renderProps(node,'callout')} {...renderSelectContainer(node,'callout')}><span className="callout-icon" aria-hidden="true">{icon}</span><div className="callout-main">{title&&<b className="callout-title">{title}</b>}<div className="callout-content">{children}</div></div></aside>;},
+      callout:({node,children,...props}:any)=>{const variant=props.variant||'info';const icon=variant==='warning'||variant==='danger'?<AlertCircle size={17}/>:variant==='success'?<CheckCircle2 size={17}/>:variant==='tip'?<Sparkles size={17}/>:<Info size={17}/>;return <aside className={`vocs-callout callout-${variant}`} {...renderProps(node,'callout')} {...renderSelectContainer(node,'callout')}><span className="callout-icon" aria-hidden="true">{icon}</span><div className="callout-main">{props.title&&<b className="callout-title">{props.title}</b>}<div className="callout-content">{children}</div></div></aside>;},
+      badge:({node,children,...props}:any)=><span data-v-badge="" data-v-context={props.variant||'info'} className={`vocs-badge badge-${props.variant||'info'} mdx-node`} {...renderProps(node,'badge')}>{children}</span>,
+      cards:({node,children,...props}:any)=><div className="vocs-cards" {...renderProps(node,'cards')}>{children}</div>,
+      card:({node,...props}:any)=>{const href=String(props.to||'#'),external=/^(https?:|mailto:|tel:|\/\/)/i.test(href);return <a href={href} target={external?'_blank':undefined} rel={external?'noopener noreferrer':undefined} className="vocs-card" {...renderProps(node,'card')} onClick={e=>{if(editableText){e.preventDefault();visualActionsRef.current.selectNode(node,'card');return;}if(external)return;const page=pageForLink(href,pages,currentFile);e.preventDefault();if(page)previewNavigationRef.current(page.path);else setStatus(`No local page matches ${href}. Use Live Vocs for full routing.`);}}><b>{props.title||'Card title'}</b><span>{props.description||''}</span></a>;},
+      tabs:({node,children,...props}:any)=><VocsTabs node={node} children={children} visualProps={renderProps}/>,
+      tab:({node,children,...props}:any)=><section className="vocs-mdx-tab" {...renderProps(node,'tab')}>{children}</section>,
+      div:({node,children,...props}:any)=>{const fileItems=nodeAttr(props,'data-v-file-tree-items');if(nodeAttr(props,'data-v-file-tree')!==undefined&&fileItems){let parsed:any[]=[];try{parsed=JSON.parse(fileItems)}catch{}return <div className="vocs-file-tree" {...renderProps(node,'file-tree')}><ul>{parsed.map((item:any,index)=><FileTreeItem key={`${item.name}-${index}`} item={item}/>)}</ul></div>;}
+        if(nodeAttr(props,'data-v-code-group')!==undefined)return <div {...renderProps(node,'code-group')}><VocsCodeGroup>{children}</VocsCodeGroup></div>;
+        if(nodeAttr(props,'data-v-steps')!==undefined)return <div className="vocs-steps" {...renderProps(node,'steps')}>{children}</div>;
+        if(nodeAttr(props,'data-v-terminal')!==undefined)return <div className="vocs-terminal" {...renderProps(node,'terminal')}>{children}</div>;
+        if(nodeAttr(props,'data-v-changelog')!==undefined)return <div className="vocs-preview-notice" {...renderProps(node,'changelog')}><Archive size={16}/><div><b>Changelog is a runtime feature</b><span>Vocs generates this content when the site runs. Open Live Vocs to see the project's real changelog.</span></div></div>;
+        if(nodeAttr(props,'data-v-benchmarks')!==undefined)return <div className="vocs-benchmarks" {...renderProps(node,'benchmarks')}><div className="vocs-benchmarks-legend"><span>Faster</span><span className="vocs-benchmarks-track"/><span>Slower</span></div><div>{children}</div></div>;
+        return <div {...props} className={`${props.className||''} mdx-node`} {...renderProps(node,'container')}>{children}</div>;},
+      table:({node,children,...props}:any)=><div className="mdx-table-wrap" {...renderProps(node,'table')}><table {...props}>{children}</table></div>,
+      span:({node,children,...props}:any)=>{const variant=nodeAttr(props,'data-v-context')||'info';if(nodeAttr(props,'data-v-badge')!==undefined)return <span data-v-badge="" data-v-context={variant} className={`vocs-badge badge-${variant} mdx-node`} {...renderProps(node,'badge')}>{children}</span>;return <span {...props} {...renderProps(node,'span')}>{children}</span>;},
+      a:({node,children,...props}:any)=>{const todo=props.href==='/TODO'||nodeAttr(props,'data-v-dead-link')!==undefined;const href=String(props.href||'');const external=/^(https?:|mailto:|tel:|\/\/)/i.test(href);return <a {...props} target={external?(props.target||'_blank'):props.target} rel={external?'noopener noreferrer':props.rel} className={todo?'vocs-todo-link':props.className} title={todo?'TODO — page not written yet':props.title} {...renderProps(node,todo?'todo':'link')} onClick={e=>{if(editableText){e.preventDefault();visualActionsRef.current.selectNode(node,todo?'todo':'link');return;}if(todo){e.preventDefault();return;}if(external||href.startsWith('#'))return;const page=pageForLink(href,pages,currentFile);e.preventDefault();if(page)previewNavigationRef.current(page.path);else setStatus(`No local page matches ${href}. Use Live Vocs for full routing.`);}}>{children}</a>;},
     } as any;
   };
   const markdownComponents=useMemo(()=>buildMarkdownComponents(true),[]);
-  const previewMarkdownComponents=useMemo(()=>buildMarkdownComponents(false),[]);
+  const previewMarkdownComponents=useMemo(()=>buildMarkdownComponents(false),[pages,currentFile]);
   const updateSelected=(field:string,value:string)=>{if(!selectedRange||!selectedModel)return;recordHistory(true);const next={...selectedModel,[field]:value};const replacement=composeEditable(next);const start=selectedRange.start,end=selectedRange.end,current=bodyRef.current;setDocumentBody(current.slice(0,start)+replacement+current.slice(end));const range={start,end:start+replacement.length,kind:selectedRange.kind};setSelectedRange(range);markDirty(true);setStatus('Unsaved visual edit');};
   const replaceSourceRange=(range:{start:number;end:number;kind:string},replacement:string,statusText='Unsaved changes')=>{recordHistory();const current=bodyRef.current;setDocumentBody(current.slice(0,range.start)+replacement+current.slice(range.end));setSelectedRange(replacement?{start:range.start,end:range.start+replacement.length,kind:range.kind}:null);markDirty(true);setStatus(statusText);};
   const insertTextAt=(kind:string,forcedOffset?:number)=>{const current=bodyRef.current,text=snippet[kind]||'';const el=textarea.current;const start=forcedOffset??(viewMode==='text'&&el?el.selectionStart:(selectedRange?.end??current.length));const end=forcedOffset??(viewMode==='text'&&el?el.selectionEnd:start);const before=current.slice(0,start),after=current.slice(end);const sep=before&&!before.endsWith('\n\n')?'\n\n':'';const next=`${before}${sep}${text}\n\n${after}`;recordHistory();setDocumentBody(next);const mark={start:start+sep.length,end:start+sep.length+text.length,kind:'inserted'};setSelectedRange(mark);markDirty(true);setStatus(`Inserted ${kind}`);caret.current=mark.end;if(viewMode==='text')requestAnimationFrame(()=>{textarea.current?.focus();textarea.current?.setSelectionRange(mark.end,mark.end);});};
@@ -329,12 +398,25 @@ function App(){
     const list=desktop?await desktop.listPages():browserProject?await browserList(browserProject.pagesHandle):[];
     setPages(list); if(browserProject) browserProject.pages=list; return list;
   },[desktop]);
-  const openPage=useCallback(async(file:string)=>{
+  const openPage=useCallback(async(file:string,keepPreview=false)=>{
     if(file!==fileRef.current&&dirtyRef.current&&!window.confirm('This page has unsaved edits. Discard them and open another page?'))return;
     try{setBusy(true);const data=desktop?await desktop.readPage(file):await (async()=>{if(!browserProject)throw new Error('Connect a project first.');let h=browserProject.pagesHandle;for(const segment of file.split('/').slice(0,-1))h=await h.getDirectoryHandle(segment);const fh=await h.getFileHandle(file.split('/').pop()!);return (await fh.getFile()).text()})();
-      historyRef.current={undo:[],redo:[],lastTyping:0};setCurrentFile(file);fileRef.current=file;setTitle(titleFromSource(data,file.split('/').pop()!.replace(/\.(md|mdx)$/i,'')));setFrontmatter(frontmatterFromSource(data));setDocumentBody(contentFromSource(data));setSelectedRange(null);setActiveTab('insert');setViewMode('visual');markDirty(false);setStatus(`Opened ${file}`);setShowPreview(false);
+      historyRef.current={undo:[],redo:[],lastTyping:0};setCurrentFile(file);fileRef.current=file;setTitle(titleFromSource(data,file.split('/').pop()!.replace(/\.(md|mdx)$/i,'')));setFrontmatter(frontmatterFromSource(data));setDocumentBody(contentFromSource(data));setSelectedRange(null);setActiveTab('insert');setViewMode('visual');markDirty(false);setStatus(`Opened ${file}`);if(!keepPreview)setShowPreview(false);
     }catch(e){setStatus(errorText(e));}finally{setBusy(false);}
   },[desktop]);
+  previewNavigationRef.current=(path:string)=>{void openPage(path,true);};
+  const previewNavContainsCurrent=(nodes:SidebarNode[]):boolean=>nodes.some(node=>node.filePath===currentFile||Boolean(node.link&&pageForLink(node.link,pages,currentFile)?.path===currentFile)||(node.items?.length?previewNavContainsCurrent(node.items):false));
+  const renderPreviewNavigation=(nodes:SidebarNode[],depth=0):React.ReactNode=>nodes.map((item,index)=>{
+    const page=item.filePath?pages.find(candidate=>candidate.path===item.filePath):pageForLink(item.link,pages,currentFile);
+    const active=Boolean(page&&page.path===currentFile);
+    const key=`${depth}-${item.text}-${item.link}-${index}`;
+    const external=item.external||/^(https?:|mailto:|tel:|\/\/)/i.test(item.link||'');
+    if(item.items?.length)return <details key={key} className="vocs-preview-nav-group" open={!item.collapsed||previewNavContainsCurrent(item.items)}><summary>{item.text||'Pages'}</summary>{page&&<button className={`vocs-preview-nav-link ${active?'active':''}`} onClick={()=>previewNavigationRef.current(page.path)}>{item.text}</button>}{external&&<a className="vocs-preview-nav-link" href={item.link} target="_blank" rel="noopener noreferrer">{item.text}</a>}<div className="vocs-preview-nav-children">{renderPreviewNavigation(item.items,depth+1)}</div></details>;
+    if(external)return <a key={key} className="vocs-preview-nav-link" href={item.link} target="_blank" rel="noopener noreferrer">{item.text||item.link}</a>;
+    return <button key={key} className={`vocs-preview-nav-link ${active?'active':''}`} onClick={()=>page&&previewNavigationRef.current(page.path)} disabled={!page}>{item.text||page?.title||item.link}</button>;
+  });
+  const previewNavNodes=project?.sidebar?.length?project.sidebar:fileHierarchy(pages);
+  const handlePreviewHref=(event:React.MouseEvent<HTMLAnchorElement>,href:string)=>{if(href.startsWith('#')||/^(https?:|mailto:|tel:|\/\/)/i.test(href))return;const page=pageForLink(href,pages,currentFile);event.preventDefault();if(page)previewNavigationRef.current(page.path);else setStatus(`No local page matches ${href||'this link'}. Use Live Vocs for full routing.`);};
   useEffect(()=>{if(!desktop)return;desktop.currentProject().then(async p=>{if(p){setProject(p);setPages(p.pages);setHierarchyMode(p.sidebar?.length?'vocs':'files');if(p.pages[0])void openPage(p.pages[0].path);else setStatus(`Connected to ${p.name}. Create your first page.`);}}).catch(e=>setStatus(errorText(e)));},[desktop,openPage]);
 
   const connect=async()=>{const discard=dirtyRef.current;if(discard&&!window.confirm('You have unsaved edits. Discard them and connect another project?'))return;try{setBusy(true);setStatus('Choose your docs folder…');const p=desktop?await desktop.chooseProject():await chooseBrowserProject();if(!p)return;if(discard)markDirty(false);setProject(p);setPages(p.pages);setHierarchyMode(p.sidebar?.length?'vocs':'files');setStatus(`Connected to ${p.name} · ${p.pagesDir}`);if(p.pages[0])await openPage(p.pages[0].path);else startNew();}catch(e){setStatus(errorText(e));}finally{setBusy(false);}};
@@ -418,7 +500,15 @@ function App(){
   ];
   const visibleCommands=commandItems.filter(item=>`${item.label} ${item.detail} ${item.keywords}`.toLowerCase().includes(commandQuery.toLowerCase())).slice(0,9);
 
-  return <div className={`app ${darkMode?'dark-mode':''}`} data-accent={accentTheme} onPaste={handlePaste}>
+  const config=project?.vocsConfig||cleanVocsConfig();
+  const previewScheme=(config.colorScheme||'light dark').toLowerCase().replace(/\s+/g,' ').trim();
+  const previewDark=accentTheme==='project'?(previewScheme==='dark'?true:previewScheme==='light'?false:darkMode):darkMode;
+  const previewAccent=accentTheme==='project'?(config.accentColor||'light-dark(black, white)'):
+    ({slate:'#37404a',ocean:'#287b9e',violet:'#7356b3',ember:'#b66b3e'} as Record<string,string>)[accentTheme];
+  const previewStyle={'--vocs-preview-accent':previewAccent} as React.CSSProperties;
+  const previewSiteName=config.title||project?.name||'Documentation';
+  const previewBannerText=typeof config.banner==='string'?config.banner:typeof config.banner?.text==='string'?config.banner.text:'';
+  return <div className={`app ${darkMode?'dark-mode':''}`} data-accent={accentTheme==='project'?'slate':accentTheme} onPaste={handlePaste}>
     <header className="topbar">
       <button className="icon-button nav-toggle" title="Toggle page list" onClick={()=>setShowNav(!showNav)}><Menu size={18}/></button>
       <div className="brand-mark"><BookOpen size={20}/></div><div className="brand">Vocs Graphical Editor</div>
@@ -428,7 +518,7 @@ function App(){
       <button className="icon-button theme-toggle" aria-label={darkMode?'Switch to light mode':'Switch to dark mode'} title={darkMode?'Switch to light mode':'Switch to dark mode'} onClick={()=>setDarkMode(value=>{const next=!value;try{localStorage.setItem('vocs-editor-theme',next?'dark':'light')}catch{}return next})}>{darkMode?<Sun size={17}/>:<Moon size={17}/>}</button>
       <div className="theme-picker-wrap">
         <button className={`icon-button theme-picker-trigger ${themeMenuOpen?'active':''}`} aria-label="Choose editor theme" aria-expanded={themeMenuOpen} title="Editor themes" onClick={()=>setThemeMenuOpen(value=>!value)}><Palette size={17}/></button>
-        {themeMenuOpen&&<><button className="theme-menu-dismiss" aria-label="Close theme menu" onClick={()=>setThemeMenuOpen(false)}/><div className="theme-menu" role="dialog" aria-label="Editor themes"><div className="theme-menu-heading"><b>Editor themes</b><span>Color the workspace your way</span></div>{([{id:'slate',label:'Slate',colors:['#e9edf1','#74808d','#37404a']},{id:'ocean',label:'Ocean',colors:['#e4f1f7','#4e9bb9','#17465b']},{id:'violet',label:'Violet',colors:['#efeafa','#8d78c6','#4d3c78']},{id:'ember',label:'Ember',colors:['#f8ece2','#cb8053','#70452e']}] as const).map(theme=><button key={theme.id} className={`theme-choice ${accentTheme===theme.id?'selected':''}`} onClick={()=>{setAccentTheme(theme.id);setThemeMenuOpen(false)}}><span className="theme-swatches">{theme.colors.map(color=><i key={color} style={{background:color}}/>)}</span><span>{theme.label}</span>{accentTheme===theme.id&&<Check size={14}/>}</button>)}</div></>}
+        {themeMenuOpen&&<><button className="theme-menu-dismiss" aria-label="Close theme menu" onClick={()=>setThemeMenuOpen(false)}/><div className="theme-menu" role="dialog" aria-label="Editor themes"><div className="theme-menu-heading"><b>Preview theme</b><span>Use the Vocs config or a manual palette</span></div><button className={`theme-choice ${accentTheme==='project'?'selected':''}`} onClick={()=>{setAccentTheme('project');setThemeMenuOpen(false)}}><span className="theme-swatches"><i style={{background:config.accentColor||'black'}}/><i style={{background:config.colorScheme==='dark'?'#20252b':'#fff'}}/><i style={{background:'var(--vocs-preview-accent)'}}/></span><span>Project theme</span>{accentTheme==='project'&&<Check size={14}/>}</button>{([{id:'slate',label:'Slate',colors:['#e9edf1','#74808d','#37404a']},{id:'ocean',label:'Ocean',colors:['#e4f1f7','#4e9bb9','#17465b']},{id:'violet',label:'Violet',colors:['#efeafa','#8d78c6','#4d3c78']},{id:'ember',label:'Ember',colors:['#f8ece2','#cb8053','#70452e']}] as const).map(theme=><button key={theme.id} className={`theme-choice ${accentTheme===theme.id?'selected':''}`} onClick={()=>{setAccentTheme(theme.id);setThemeMenuOpen(false)}}><span className="theme-swatches">{theme.colors.map(color=><i key={color} style={{background:color}}/>)}</span><span>{theme.label}</span>{accentTheme===theme.id&&<Check size={14}/>}</button>)}</div></>}
       </div>
       <button className="icon-button command-trigger" aria-label="Open quick actions" title="Quick actions · Ctrl/⌘ Shift P" onClick={()=>{setCommandQuery('');setCommandOpen(true);requestAnimationFrame(()=>commandInput.current?.focus());}}><CommandIcon size={17}/></button>
       <button className="button secondary" onClick={()=>void connect()} disabled={busy}><FolderOpen size={16}/><span>{project?'Change folder':'Connect docs folder'}</span></button>
@@ -469,9 +559,16 @@ function App(){
             {project&&<div className="page-footnote"><span>Markdown + MDX</span><span>{body.length} characters</span></div>}
           </section>
           {showPreview&&<div className="splitter" role="separator" aria-orientation={window.innerWidth<=650?'horizontal':'vertical'} aria-label={`Resize panes. Editor ${splitRatio}%, preview ${100-splitRatio}%.`} onPointerDown={resizeSplit}><span>{splitRatio}% · {100-splitRatio}%</span></div>}
-          {showPreview&&<section className="preview-pane" style={{flex:`${100-splitRatio} 1 0`}}><div className="preview-heading"><div><b>{previewMode==='local'?'Offline Markdown preview':'Live Vocs site'}</b><span>{previewMode==='local'?'Built-in renderer · no Node.js needed':previewUrl||'Vocs preview not running'}</span></div><div className="preview-actions">{previewMode==='local'?<button className="view-toggle" onClick={()=>void previewVocs()} disabled={!project||busy} title="Start the connected Vocs site"><Terminal size={14}/>Live Vocs</button>:<button className="view-toggle" onClick={offlinePreview} title="Use the built-in offline preview"><BookOpen size={14}/>Offline</button>}<label className="zoom-control" title="Preview zoom"><span>Zoom</span><select aria-label="Preview zoom" value={previewZoom} onChange={e=>setPreviewZoom(Number(e.target.value))}>{[50,67,75,90,100,110,125,150].map(v=><option key={v} value={v}>{v}%</option>)}</select></label>{previewMode==='vocs'&&<><button className="icon-button" onClick={()=>setPreviewRefresh(value=>value+1)} disabled={!previewUrl} title="Refresh live preview"><RefreshCw size={15}/></button><button className="icon-button" onClick={openPreviewInBrowser} disabled={!previewUrl} title="Open preview in browser"><ExternalLink size={15}/></button></>}<button className="icon-button" onClick={()=>setShowPreview(false)} title="Close preview"><X size={16}/></button></div></div>
+          {showPreview&&<section className="preview-pane" style={{flex:`${100-splitRatio} 1 0`}}><div className="preview-heading"><div><b>{previewMode==='local'?'Offline Markdown preview':'Live Vocs site'}</b><span>{previewMode==='local'?'Built-in renderer · no Node.js needed':previewUrl||'Vocs preview not running'}</span></div><div className="preview-actions">{previewMode==='local'?<><button className="view-toggle" onClick={()=>void previewVocs()} disabled={!project||busy} title="Start the connected Vocs site"><Terminal size={14}/>Live Vocs</button><label className="zoom-control viewport-control" title="Preview viewport"><span>Viewport</span><select aria-label="Preview viewport" value={previewViewport} onChange={e=>setPreviewViewport(e.target.value as 'desktop'|'tablet'|'mobile')}><option value="desktop">Desktop</option><option value="tablet">Tablet</option><option value="mobile">Mobile</option></select></label></>:<button className="view-toggle" onClick={offlinePreview} title="Use the built-in offline preview"><BookOpen size={14}/>Offline</button>}<label className="zoom-control" title="Preview zoom"><span>Zoom</span><select aria-label="Preview zoom" value={previewZoom} onChange={e=>setPreviewZoom(Number(e.target.value))}>{[50,67,75,90,100,110,125,150].map(v=><option key={v} value={v}>{v}%</option>)}</select></label>{previewMode==='vocs'&&<><button className="icon-button" onClick={()=>setPreviewRefresh(value=>value+1)} disabled={!previewUrl} title="Refresh live preview"><RefreshCw size={15}/></button><button className="icon-button" onClick={openPreviewInBrowser} disabled={!previewUrl} title="Open preview in browser"><ExternalLink size={15}/></button></>}<button className="icon-button" onClick={()=>setShowPreview(false)} title="Close preview"><X size={16}/></button></div></div>
             {!desktop&&previewMode==='vocs'&&<div className="preview-url"><input aria-label="Vocs preview address" value={previewBase} onChange={e=>setPreviewBase(e.target.value)} placeholder="http://localhost:5173"/><button className="button secondary" onClick={()=>void previewVocs()} disabled={busy}><RefreshCw size={14}/>Open</button></div>}
-            {previewMode==='vocs'?previewUrl?<div className="preview-frame-wrap"><iframe key={`${previewUrl}-${previewRefresh}`} title="Live Vocs page preview" src={previewUrl} style={{width:`${10000/previewZoom}%`,height:`${10000/previewZoom}%`,transform:`scale(${previewZoom/100})`}}/></div>:<div className="preview-empty"><Eye size={25}/><b>{previewError?'Vocs preview could not start':busy?'Preparing live preview…':'Vocs preview is not running'}</b><p>{previewError||status}</p>{previewError&&<button className="button secondary" onClick={()=>void previewVocs()} disabled={busy}><RefreshCw size={14}/>Try again</button>}</div>:<div className="local-preview-canvas"><article className="local-preview-document" style={{zoom:`${previewZoom}%`}}><div className="local-preview-kicker">MARKDOWN + VOCS COMPONENTS</div><h1>{title}</h1><div className="local-preview-rule"/><div className="visual-body" onBeforeInput={e=>e.preventDefault()}>{body.trim()?<MarkdownErrorBoundary key={`local-${currentFile}-${body}`}><ReactMarkdown remarkPlugins={markdownPlugins.remark} rehypePlugins={markdownPlugins.rehype} components={previewMarkdownComponents}>{body}</ReactMarkdown></MarkdownErrorBoundary>:<div className="preview-empty"><Eye size={22}/><b>Nothing to preview yet</b><p>Add Markdown or a Vocs block and it will show here.</p></div>}</div></article></div>}
+            {previewMode==='vocs'?previewUrl?<div className="preview-frame-wrap"><iframe key={`${previewUrl}-${previewRefresh}`} title="Live Vocs page preview" src={previewUrl} style={{width:`${10000/previewZoom}%`,height:`${10000/previewZoom}%`,transform:`scale(${previewZoom/100})`}}/></div>:<div className="preview-empty"><Eye size={25}/><b>{previewError?'Vocs preview could not start':busy?'Preparing live preview…':'Vocs preview is not running'}</b><p>{previewError||status}</p>{previewError&&<button className="button secondary" onClick={()=>void previewVocs()} disabled={busy}><RefreshCw size={14}/>Try again</button>}</div>:<div className="local-preview-canvas"><div className="local-preview-viewport" data-viewport={previewViewport} data-theme={previewDark?'dark':'light'} style={{...previewStyle,zoom:`${previewZoom}%`}}>
+              <header className="vocs-preview-topnav">{config.logoUrl&&<img className="vocs-preview-logo" src={config.logoUrl} alt=""/>}<a className="vocs-preview-brand" href="/" onClick={e=>handlePreviewHref(e,'/')}>{previewSiteName}</a><nav aria-label="Site navigation">{(config.topNav||[]).map((item,index)=>{const external=item.external||/^(https?:|mailto:|tel:|\/\/)/i.test(item.link||'');return <a key={`${item.text}-${index}`} href={item.link||'#'} target={external?'_blank':undefined} rel={external?'noopener noreferrer':undefined} onClick={e=>handlePreviewHref(e,item.link||'')}>{item.text}</a>;})}</nav><span className="vocs-preview-mode">{previewViewport}</span></header>
+              {previewBannerText&&<div className="vocs-preview-banner">{previewBannerText}</div>}
+              <div className="vocs-preview-content"><aside className="vocs-preview-sidebar"><div className="vocs-preview-sidebar-title">{previewSiteName}</div>{renderPreviewNavigation(previewNavNodes)}</aside>
+                <main className="vocs-preview-main"><div className="vocs-preview-breadcrumb">{currentFile?currentFile.split('/').slice(0,-1).join(' / '):'Documentation'}</div><article className="local-preview-document"><h1>{title}</h1>{config.description&&<p className="vocs-preview-description">{config.description}</p>}<div className="local-preview-rule"/><div className="visual-body" onBeforeInput={e=>e.preventDefault()}>{body.trim()?<MarkdownErrorBoundary key={`local-${currentFile}-${body}`}><ReactMarkdown remarkPlugins={markdownPlugins.remark} rehypePlugins={markdownPlugins.rehype} components={previewMarkdownComponents}>{body}</ReactMarkdown></MarkdownErrorBoundary>:<div className="preview-empty"><Eye size={22}/><b>Nothing to preview yet</b><p>Add Markdown or a Vocs block and it will show here.</p></div>}</div></article></main>
+                {previewHeadings.length>0&&<aside className="vocs-preview-outline"><b>On this page</b>{previewHeadings.map((heading,index)=><button key={`${heading.id}-${index}`} className={`outline-level-${heading.level}`} onClick={()=>document.getElementById(heading.id)?.scrollIntoView({behavior:'smooth',block:'start'})}>{heading.text}</button>)}</aside>}
+              </div>
+            </div></div>}
           </section>}
         </div>
       </main>
